@@ -11,10 +11,12 @@ from meme_downloader.db.database import Database
 from meme_downloader.fetchers.base import BaseFetcher
 from meme_downloader.fetchers.reddit import RedditFetcher
 from meme_downloader.fetchers.imgur import ImgurFetcher
+from meme_downloader.fetchers.gengtu import GengtuFetcher
 
 _REGISTRY: dict[str, type[BaseFetcher]] = {
     "reddit": RedditFetcher,
     "imgur": ImgurFetcher,
+    "gengtu": GengtuFetcher,
 }
 
 
