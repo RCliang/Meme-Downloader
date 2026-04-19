@@ -17,9 +17,9 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://gengtu.net"
 
 _CARD_START_RE = re.compile(r'data-meme-id="(\d+)"')
-_IMG_SRC_RE = re.compile(r'<img\s+[^>]*src="([^"]+)"')
-_TITLE_RE = re.compile(r'<h2[^>]*class="[^"]*card-title[^"]*"[^>]*>\s*<a[^>]*>([^<]+)</a>')
-_DESC_RE = re.compile(r'<p[^>]*class="[^"]*text-sm text-gray-500[^"]*"[^>]*>([^<]+)</p>')
+_IMG_SRC_RE = re.compile(r'<img\s+[^>]*src="(https://gengtu\.tos-accelerate\.volces\.com/memes/[^"]+)"')
+_TITLE_RE = re.compile(r'class="card-title[^"]*">\s*<a[^>]*>([^<]+)</a>')
+_DESC_RE = re.compile(r'class="text-sm text-gray-500"[^>]*>([^<]+)</p>')
 
 # Volcengine TOS image processing param — strip for original quality
 _IMAGE_PROCESS_SUFFIX = "?x-tos-process=style/c"
@@ -31,8 +31,7 @@ class GengtuFetcher(BaseFetcher):
     name = "gengtu"
 
     async def fetch(self, limit: int = 20, **kwargs) -> list[FetchResult]:
-        seed = kwargs.get("seed", random.randint(1, 99999))
-        url = f"{BASE_URL}/memes/random/{seed}/"
+        url = f"{BASE_URL}/memes/random/"
 
         html = await asyncio.to_thread(self._fetch_html, url)
         if not html:
@@ -66,8 +65,9 @@ class GengtuFetcher(BaseFetcher):
         scraper = cloudscraper.create_scraper()
         try:
             resp = scraper.get(url, timeout=30)
-            resp.raise_for_status()
-            return resp.text
+            html = resp.text
+            logger.info("Fetched gengtu.net page: %d bytes", len(html))
+            return html
         except Exception as e:
             logger.warning("Failed to fetch gengtu.net page %s: %s", url, e)
             return ""
