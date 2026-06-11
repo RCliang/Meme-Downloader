@@ -17,6 +17,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+vector = [
+    "openai>=1.30",
+    "pymilvus>=2.4",
+]
 bot = [
     "nonebot2>=2.3",
     "nonebot-adapter-onebot>=2.4",

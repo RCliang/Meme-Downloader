@@ -61,6 +61,7 @@ class Meme:
     title: str = ""
     url: str = ""
     tags: list[str] = field(default_factory=list)
+    description: str = ""
     created_at: datetime | None = None
     post_at: datetime | None = None
 
@@ -79,6 +80,7 @@ class Database:
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
+        await self._migrate()
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -94,13 +96,21 @@ class Database:
 
     # ── Meme CRUD ──────────────────────────────────────────────
 
+    async def _migrate(self) -> None:
+        """Run lightweight migrations for schema changes."""
+        try:
+            await self.conn.execute("SELECT description FROM memes LIMIT 0")
+        except aiosqlite.OperationalError:
+            await self.conn.execute("ALTER TABLE memes ADD COLUMN description TEXT DEFAULT ''")
+            await self.conn.commit()
+
     async def add_meme(self, meme: Meme) -> int:
         """Insert a meme record. Returns the row id."""
         tags_json = json.dumps(meme.tags, ensure_ascii=False)
         cursor = await self.conn.execute(
-            """INSERT OR IGNORE INTO memes (hash, filename, source, source_id, title, url, tags, post_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (meme.hash, meme.filename, meme.source, meme.source_id, meme.title, meme.url, tags_json, meme.post_at),
+            """INSERT OR IGNORE INTO memes (hash, filename, source, source_id, title, url, tags, post_at, description)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (meme.hash, meme.filename, meme.source, meme.source_id, meme.title, meme.url, tags_json, meme.post_at, meme.description),
         )
         await self.conn.commit()
         return cursor.lastrowid
@@ -181,6 +191,21 @@ class Database:
 
     # ── Tags ───────────────────────────────────────────────────
 
+    async def get_memes_with_descriptions(
+        self, source: str = "", limit: int = 100
+    ) -> list[Meme]:
+        """Get memes that have descriptions (for vector indexing)."""
+        query = "SELECT * FROM memes WHERE description != '' AND description IS NOT NULL"
+        params: list[Any] = []
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+        query += f" ORDER BY id ASC LIMIT {int(limit)}"
+        rows = await self.conn.execute_fetchall(query, params)
+        return [self._row_to_meme(r) for r in rows]
+
+    # ── Tags (continued) ──────────────────────────────────────
+
     async def add_tag(self, meme_id: int, tag_name: str) -> None:
         """Add a tag to a meme, creating the tag if needed."""
         await self.conn.execute(
@@ -241,6 +266,7 @@ class Database:
             title=row["title"],
             url=row["url"],
             tags=tags,
+            description=row["description"] if "description" in row.keys() else "",
             created_at=row["created_at"],
             post_at=row["post_at"],
         )

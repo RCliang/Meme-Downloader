@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from meme_downloader.config import Config
-from meme_downloader.cli.utils import db_session, get_http_client
+from meme_downloader.cli.utils import db_session, get_http_client, is_vector_enabled
 
 console = Console()
 
@@ -35,16 +35,33 @@ def cli():
 @click.option("--source", "-s", default=None, help="Only fetch from this source (e.g. reddit, imgur)")
 @click.option("--limit", "-n", default=20, help="Max items to fetch per source")
 @click.option("--tag", "-t", default=None, help="Auto-tag fetched items")
-def sync(source: str | None, limit: int, tag: str | None):
+@click.option("--keyword", "-k", default=None, help="Search keyword (gengtu source)")
+def sync(source: str | None, limit: int, tag: str | None, keyword: str | None):
     """Fetch new memes from configured sources."""
-    run_async(_sync(source, limit, tag))
+    run_async(_sync(source, limit, tag, keyword))
 
 
-async def _sync(source: str | None, limit: int, tag: str | None):
+async def _sync(source: str | None, limit: int, tag: str | None, keyword: str | None):
     from meme_downloader.fetchers.registry import get_fetcher, list_sources
 
     config = Config.load()
     config.ensure_dirs()
+
+    vector_ready = is_vector_enabled(config)
+    embedding_client = None
+    store = None
+    if vector_ready:
+        try:
+            from meme_downloader.vector.embedding import EmbeddingClient
+            from meme_downloader.vector.store import MilvusStore
+            import asyncio
+
+            embedding_client = EmbeddingClient(config.vector.embedding)
+            store = MilvusStore(config.vector.milvus, dimensions=config.vector.embedding.dimensions)
+            await asyncio.to_thread(store.connect)
+        except Exception as e:
+            console.print(f"[yellow]Vector store unavailable, skipping embeddings: {e}[/yellow]")
+            vector_ready = False
 
     async with db_session(config) as db:
         async with get_http_client() as client:
@@ -59,7 +76,7 @@ async def _sync(source: str | None, limit: int, tag: str | None):
                     continue
 
                 console.print(f"[bold blue]Fetching from {src_name}...[/bold blue]")
-                results = await fetcher.fetch(limit=limit)
+                results = await fetcher.fetch(limit=limit, keyword=keyword or "")
 
                 saved = 0
                 for result in results:
@@ -70,8 +87,24 @@ async def _sync(source: str | None, limit: int, tag: str | None):
                         saved += 1
                         console.print(f"  [green]+[/green] {meme.title[:60]}")
 
+                        if vector_ready and embedding_client and store and meme.description:
+                            try:
+                                import asyncio
+                                embedding = await embedding_client.embed_text(meme.description)
+                                if embedding:
+                                    await asyncio.to_thread(store.upsert, meme.id, meme.source, embedding)
+                            except Exception:
+                                pass
+
                 console.print(f"  [dim]{saved}/{len(results)} saved from {src_name}[/dim]")
                 total_saved += saved
+
+    if store:
+        try:
+            import asyncio
+            await asyncio.to_thread(store.disconnect)
+        except Exception:
+            pass
 
     console.print(f"\n[bold green]Done. {total_saved} new memes saved.[/bold green]")
 
@@ -339,3 +372,147 @@ async def _stats():
         for source, count in s["by_source"].items():
             table.add_row(source, str(count))
         console.print(table)
+
+
+# ── similar ─────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("query")
+@click.option("--source", "-s", default=None, help="Filter by source")
+@click.option("--limit", "-n", default=10, help="Max results")
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def similar(query: str, source: str | None, limit: int, as_json: bool):
+    """Find memes similar to a text description."""
+    run_async(_similar(query, source, limit, as_json))
+
+
+async def _similar(query: str, source: str | None, limit: int, as_json: bool):
+    config = Config.load()
+    if not is_vector_enabled(config):
+        console.print("[yellow]Vector search is not configured.[/yellow]")
+        console.print("Add vector config to ~/.meme-downloader/config.yaml:")
+        console.print("  vector:")
+        console.print("    enabled: true")
+        console.print("    embedding:")
+        console.print("      api_key: your-dashscope-api-key")
+        console.print("    milvus:")
+        console.print("      uri: http://localhost:19530")
+        return
+
+    try:
+        from meme_downloader.vector.embedding import EmbeddingClient
+        from meme_downloader.vector.store import MilvusStore
+    except ImportError:
+        console.print("[yellow]Install vector support: pip install meme-downloader[vector][/yellow]")
+        return
+
+    import asyncio
+
+    embedding_client = EmbeddingClient(config.vector.embedding)
+    query_embedding = await embedding_client.embed_text(query)
+    if query_embedding is None:
+        console.print("[red]Failed to generate embedding for query.[/red]")
+        return
+
+    store = MilvusStore(config.vector.milvus, dimensions=config.vector.embedding.dimensions)
+    try:
+        await asyncio.to_thread(store.connect)
+        results = await asyncio.to_thread(store.search, query_embedding, top_k=limit, source=source or "")
+    finally:
+        await asyncio.to_thread(store.disconnect)
+
+    if not results:
+        console.print("[yellow]No similar memes found.[/yellow]")
+        return
+
+    async with db_session(config) as db:
+        memes = []
+        for r in results:
+            meme = await db.get_meme_by_id(r.meme_id)
+            if meme:
+                memes.append((meme, r.score))
+
+    if as_json:
+        import json as json_mod
+        data = [
+            {"id": m.id, "title": m.title, "source": m.source, "score": round(s, 4), "description": m.description}
+            for m, s in memes
+        ]
+        console.print_json(json_mod.dumps(data, ensure_ascii=False, indent=2))
+        return
+
+    table = Table(title=f"Similar to: {query}")
+    table.add_column("ID", style="cyan", width=6)
+    table.add_column("Score", style="magenta", width=8)
+    table.add_column("Title", style="white", max_width=40)
+    table.add_column("Source", style="green", width=10)
+    table.add_column("Description", style="dim", max_width=30)
+
+    for meme, score in memes:
+        table.add_row(
+            str(meme.id),
+            f"{score:.3f}",
+            meme.title or "-",
+            meme.source,
+            (meme.description or "-")[:30],
+        )
+
+    console.print(table)
+
+
+# ── index ────────────────────────────────────────────────────
+
+@cli.command()
+@click.option("--source", "-s", default=None, help="Only index memes from this source")
+@click.option("--limit", "-n", default=100, help="Max memes to index")
+def index(source: str | None, limit: int):
+    """Index existing memes into the vector store for similarity search."""
+    run_async(_index(source, limit))
+
+
+async def _index(source: str | None, limit: int):
+    config = Config.load()
+    if not is_vector_enabled(config):
+        console.print("[yellow]Vector search is not configured.[/yellow]")
+        return
+
+    try:
+        from meme_downloader.vector.embedding import EmbeddingClient
+        from meme_downloader.vector.store import MilvusStore
+    except ImportError:
+        console.print("[yellow]Install vector support: pip install meme-downloader[vector][/yellow]")
+        return
+
+    import asyncio
+
+    embedding_client = EmbeddingClient(config.vector.embedding)
+    store = MilvusStore(config.vector.milvus, dimensions=config.vector.embedding.dimensions)
+
+    async with db_session(config) as db:
+        memes = await db.get_memes_with_descriptions(source=source or "", limit=limit)
+
+    if not memes:
+        console.print("[yellow]No memes with descriptions to index.[/yellow]")
+        return
+
+    console.print(f"[bold]Indexing {len(memes)} memes...[/bold]")
+
+    texts = [m.description for m in memes]
+    embeddings = await embedding_client.embed_batch(texts)
+
+    meme_ids = [m.id for m in memes]
+    sources = [m.source for m in memes]
+    valid_embeddings = [e for e in embeddings if e is not None]
+    valid_ids = [mid for mid, e in zip(meme_ids, embeddings) if e is not None]
+    valid_sources = [s for s, e in zip(sources, embeddings) if e is not None]
+
+    if not valid_embeddings:
+        console.print("[red]Failed to generate any embeddings.[/red]")
+        return
+
+    try:
+        await asyncio.to_thread(store.connect)
+        await asyncio.to_thread(store.upsert_batch, valid_ids, valid_sources, valid_embeddings)
+        console.print(f"[bold green]Indexed {len(valid_embeddings)}/{len(memes)} memes.[/bold green]")
+    finally:
+        await asyncio.to_thread(store.disconnect)

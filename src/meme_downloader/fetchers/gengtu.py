@@ -31,30 +31,54 @@ class GengtuFetcher(BaseFetcher):
     name = "gengtu"
 
     async def fetch(self, limit: int = 20, **kwargs) -> list[FetchResult]:
-        url = f"{BASE_URL}/memes/random/"
-
-        html = await asyncio.to_thread(self._fetch_html, url)
-        if not html:
-            return []
-
-        cards = self._parse_cards(html)
-        if not cards:
-            logger.warning("Parsed 0 cards from gengtu.net (page may have changed)")
+        keyword = kwargs.get("keyword", "")
+        if keyword:
+            from urllib.parse import quote
+            base_url = f"{BASE_URL}/memes/search/?q={quote(keyword)}&meme_page="
+        else:
+            base_url = None
 
         results: list[FetchResult] = []
-        for source_id, title, image_url, _description in cards:
-            if await self.db.is_fetched("gengtu", source_id):
-                continue
+        page = 1
 
-            meme = Meme(
-                source="gengtu",
-                source_id=source_id,
-                title=title,
-                url=image_url,
-            )
-            results.append(FetchResult(meme=meme))
-            if len(results) >= limit:
+        while True:
+            url = f"{base_url}{page}" if base_url else f"{BASE_URL}/memes/random/"
+
+            html = await asyncio.to_thread(self._fetch_html, url)
+            if not html:
                 break
+
+            cards = self._parse_cards(html)
+            if not cards:
+                break
+
+            new_on_this_page = 0
+            for source_id, title, image_url, description in cards:
+                if await self.db.is_fetched("gengtu", source_id):
+                    continue
+
+                meme = Meme(
+                    source="gengtu",
+                    source_id=source_id,
+                    title=title,
+                    url=image_url,
+                    description=description,
+                )
+                results.append(FetchResult(meme))
+                new_on_this_page += 1
+                if len(results) >= limit:
+                    return results
+
+            # Random mode: only one page
+            if not base_url:
+                break
+
+            # Search mode: stop if no new items on this page (all duplicates or end of results)
+            if new_on_this_page == 0:
+                break
+
+            page += 1
+            logger.info("Gengtu search page %d: %d new items", page - 1, new_on_this_page)
 
         return results
 
